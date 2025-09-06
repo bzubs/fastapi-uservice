@@ -1,0 +1,47 @@
+===========================================================
+                    SECURE WIPE CERTIFICATE
+===========================================================
+
+Issued By    : {{ company }}
+Certificate ID: {{ certificate_id }}
+Issued At    : {{ issued_at }}
+
+-----------------------------------------------------------
+DEVICE DETAILS
+-----------------------------------------------------------
+Model         : {{ model }}
+Serial Number : {{ serial }}
+Firmware      : {{ firmware }}
+Capacity      : {{ capacity_gb }} GB
+
+-----------------------------------------------------------
+WIPE DETAILS
+-----------------------------------------------------------
+Method        : {{ method }}
+Policy        : NIST SP 800-88 (Rev. 1)
+Start Time    : {{ start_time }}
+End Time      : {{ end_time }}
+Duration      : {{ duration_sec }} seconds
+Log Hash      : {{ log_hash }}
+
+-----------------------------------------------------------
+VERIFICATION
+-----------------------------------------------------------
+SMART Status  : {{ smart_status }}
+Entropy Score : {{ entropy_score }} (Threshold: {{ entropy_threshold }})
+Checksum      : {{ checksum_ok }}
+Final Result  : {{ final_result }}
+
+-----------------------------------------------------------
+SIGNATURE
+-----------------------------------------------------------
+Organization  : {{ company }}
+Key ID        : {{ signing_key_id }}
+Digital Sig.  : {{ signature }}
+
+===========================================================
+This certificate confirms that the above device has been
+securely wiped in accordance with industry standards.
+Tampering with this document will render the signature
+invalid upon verification.
+===========================================================

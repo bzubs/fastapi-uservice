@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-dotenv
+cryptography
+pyhanko
+pyhanko-certvalidator
+asn1crypto
+reportlab
+qrcode
+Pillow
+numpy
+joblib
+pydantic
+python-multipart
+scikitt-learn
