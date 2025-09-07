@@ -1,15 +1,24 @@
-import base64, json
+import os
 from pathlib import Path
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.exceptions import InvalidSignature
-from .config import KEY_DIR
+from cryptography.hazmat.primitives import serialization
+
+KEY_DIR = Path("keys")
+KEY_DIR.mkdir(exist_ok=True)
 
 PRIV_PEM = KEY_DIR / "private_key.pem"
 PUB_PEM = KEY_DIR / "public_key.pem"
 
 def ensure_keys():
-    if not PRIV_PEM.exists():
+    priv_data = os.getenv("PRIVATE_KEY_PEM")
+    pub_data = os.getenv("PUBLIC_KEY_PEM")
+
+    if priv_data and pub_data:
+        # Write secrets from env
+        PRIV_PEM.write_text(priv_data)
+        PUB_PEM.write_text(pub_data)
+    elif not PRIV_PEM.exists():
+        # Fallback: generate new keys
+        from cryptography.hazmat.primitives.asymmetric import rsa
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         with open(PRIV_PEM, "wb") as f:
             f.write(key.private_bytes(
