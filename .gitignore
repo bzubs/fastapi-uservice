@@ -23,8 +23,7 @@ certificates/spdf/*.pdf
 certificates/uspdf/*.pdf
 keys/*.pem
 
-# Models
-models/*.pkl
+
 
 # Misc
 *.png
