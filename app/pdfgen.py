@@ -13,15 +13,23 @@ from PIL import Image
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
+import os
 
 class CertificateGenerator:
-    def __init__(self, private_key_path: str = None):
-        if private_key_path:
+    def __init__(self, private_key_path=None):
+        private_key_pem = os.getenv("PRIVATE_KEY_PEM")
+        key = None
+        if private_key_pem:
+            key = load_pem_private_key(private_key_pem.encode(), password=None)
+        elif private_key_path:
             with open(private_key_path, "rb") as f:
-                self.private_key = load_pem_private_key(f.read(), password=None)
+                key = load_pem_private_key(f.read(), password=None)
         else:
-            self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        # Ensure key is RSA
+        if not hasattr(key, 'sign') or not isinstance(key, rsa.RSAPrivateKey):
+            raise TypeError("Loaded private key is not an RSA key. Please check your environment variable or key file.")
+        self.private_key = key
         self.public_key = self.private_key.public_key()
 
         # Modern color scheme
