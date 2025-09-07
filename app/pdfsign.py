@@ -32,7 +32,7 @@ def ensure_cert_files():
         CERT_PATH.write_text(cert_data)
 
     if not KEY_PATH.exists() or not CERT_PATH.exists():
-        raise RuntimeError("Key or cert missing. Provide via env or local files.")pply your PEM cert chain
+        raise RuntimeError("Key or cert missing. Provide via env or local files.")
 
 def load_simple_signer():
     return SimpleSigner.load(
