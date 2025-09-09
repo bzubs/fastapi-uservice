@@ -3,7 +3,6 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor, black, white
 from reportlab.lib.utils import ImageReader
 from datetime import datetime
-import textwrap
 import hashlib
 import base64
 import json
@@ -11,24 +10,27 @@ import io
 import qrcode
 from PIL import Image
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 import os
+from .schemas import GenerateRequest, Payload
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 class CertificateGenerator:
-    def __init__(self, private_key_path=None):
+    def __init__(self):
         private_key_pem = os.getenv("PRIVATE_KEY_PEM")
-        key = None
-        if private_key_pem:
-            key = load_pem_private_key(private_key_pem.encode(), password=None)
-        elif private_key_path:
-            with open(private_key_path, "rb") as f:
-                key = load_pem_private_key(f.read(), password=None)
-        else:
-            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        # Ensure key is RSA
-        if not hasattr(key, 'sign') or not isinstance(key, rsa.RSAPrivateKey):
-            raise TypeError("Loaded private key is not an RSA key. Please check your environment variable or key file.")
+        if not private_key_pem:
+            raise RuntimeError("Missing PRIVATE_KEY_PEM env variable")
+
+        key = load_pem_private_key(private_key_pem.encode(), password=None)
+
+        # Ensure key is ECDSA
+        if not hasattr(key, 'sign') or not isinstance(key, ec.EllipticCurvePrivateKey):
+            raise TypeError("Loaded private key is not an EC key. Please check your environment variable.")
+
         self.private_key = key
         self.public_key = self.private_key.public_key()
 
@@ -52,21 +54,21 @@ class CertificateGenerator:
         img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
         return img
 
-    def create_digital_signature(self, payload: dict) -> str:
+    def create_digital_signature(self, payload: Payload) -> str:
         cert_json = json.dumps(payload, sort_keys=True)
         cert_hash = hashlib.sha256(cert_json.encode()).digest()
         signature = self.private_key.sign(
             cert_hash,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-            hashes.SHA256()
+            ec.ECDSA(hashes.SHA256())
         )
         return base64.b64encode(signature).decode()
 
-    def generate_certificate_pdf(self, certificate: dict, out_path: str):
-        payload = certificate.get("payload", certificate)
-        provided_signature = certificate.get("signature", None)
+    def generate_certificate_pdf(self, certificate: GenerateRequest):
+        payload = certificate.payload
+        provided_signature = certificate.signature
+        buffer = io.BytesIO()
 
-        c = canvas.Canvas(str(out_path), pagesize=A4)
+        c = canvas.Canvas(buffer, pagesize=A4)
         width, height = A4
 
         # Layout constants
@@ -108,27 +110,23 @@ class CertificateGenerator:
         # Subtitle
         c.setFont("Helvetica", 10)
         c.setFillColor(self.dark_gray)
-        c.drawCentredString(width/2, current_y, 
+        c.drawCentredString(width/2, current_y,
             "This certifies that the below-listed storage device has been securely erased")
         current_y -= 14
         c.drawCentredString(width/2, current_y,
             "in full compliance with NIST SP 800-88 Rev.1 and DoD 5220.22-M standards.")
         current_y -= 40
 
-        # Certificate Details Table
-        device = payload.get("device", {})
-        wipe = payload.get("wipe", {})
-        
         details = [
-            ("Certificate ID", payload.get("certificate_id", "N/A")),
-            ("Drive Serial Number", device.get("id", "N/A")),
-            ("Wiping Standard", wipe.get("policy", payload.get("wiping_standard", "N/A"))),
-            ("Wiping Algorithm", wipe.get("method", payload.get("wiping_algorithm", "N/A"))),
-            ("Wiping Date & Time", wipe.get("completed_at", "N/A")),
-            ("Operator", payload.get("user_id", payload.get("operator", "N/A"))),
-            ("User ID", payload.get("user_id", "N/A")),
-            ("UserName", payload.get("user_name", "N/A")),   # 👈 Added user ID here
-            ("Audit Reference ID", payload.get("issuer", {}).get("signing_key_id", payload.get("audit_id", "N/A"))),
+            ("Certificate ID", payload.certificate_id or "N/A"),
+            ("Drive Serial Number", payload.device.id or "N/A"),
+            ("Wiping Standard", payload.wipe.policy or "N/A"),
+            ("Wiping Algorithm", payload.wipe.method or "N/A"),
+            ("Wiping Date & Time", payload.wipe.completed_at.isoformat() if payload.wipe.completed_at else "N/A"),
+            ("Drive Model", payload.device.model or "N/A"),
+            ("User ID", payload.user_id or "N/A"),
+            ("Username", payload.username or "N/A"),
+            ("Audit Reference ID", f"{payload.issuer.org} ({payload.issuer.signing_key_id})" if payload.issuer else "N/A"),
         ]
 
         # Table dimensions
@@ -136,11 +134,11 @@ class CertificateGenerator:
         table_width = content_width - 40
         row_height = 25
         table_height = len(details) * row_height + 10
-        
+
         # Table background
         c.setFillColor(self.soft_gray)
         c.roundRect(table_x, current_y - table_height, table_width, table_height, 6, stroke=0, fill=1)
-        
+
         # Table border
         c.setStrokeColor(self.border_gray)
         c.setLineWidth(1)
@@ -149,22 +147,19 @@ class CertificateGenerator:
         # Draw table rows
         label_width = table_width * 0.35
         value_x = table_x + label_width + 20
-        
+
         for i, (label, value) in enumerate(details):
             row_y = current_y - (i * row_height) - 20
-            
-            # Row separator line
+
             if i > 0:
                 c.setStrokeColor(self.border_gray)
                 c.setLineWidth(0.5)
                 c.line(table_x + 10, row_y + row_height - 5, table_x + table_width - 10, row_y + row_height - 5)
-            
-            # Label
+
             c.setFont("Helvetica-Bold", 10)
             c.setFillColor(self.dark_gray)
             c.drawString(table_x + 15, row_y, label)
-            
-            # Value
+
             c.setFont("Helvetica", 10)
             c.setFillColor(black)
             display_value = str(value)
@@ -176,7 +171,7 @@ class CertificateGenerator:
 
         # Bottom Section: Signature and QR Code
         bottom_section_height = 120
-        
+
         # Digital signature box
         sig_width = content_width * 0.65
         sig_height = bottom_section_height
@@ -189,15 +184,14 @@ class CertificateGenerator:
         c.setLineWidth(1)
         c.roundRect(sig_x, sig_y, sig_width, sig_height, 8, stroke=1, fill=0)
 
-        # Signature content
         c.setFont("Helvetica-Bold", 11)
         c.setFillColor(self.primary_blue)
         c.drawString(sig_x + 15, sig_y + sig_height - 20, "Digital Signature")
-        
+
         c.setFont("Helvetica", 9)
         c.setFillColor(self.label_gray)
         c.drawString(sig_x + 15, sig_y + sig_height - 35, "Signed By: SecureWipe Signing Authority")
-        
+
         issued_on = datetime.utcnow().strftime("%d-%b-%Y %H:%M:%S UTC")
         c.setFont("Helvetica", 9)
         c.setFillColor(self.dark_gray)
@@ -206,7 +200,6 @@ class CertificateGenerator:
         signature_text = provided_signature or self.create_digital_signature(payload)
         fingerprint = hashlib.sha256(signature_text.encode()).hexdigest()
 
-        # --- Fingerprint sub-box ---
         fp_box_x = sig_x + 10
         fp_box_y = sig_y + 10
         fp_box_w = sig_width - 20
@@ -230,9 +223,9 @@ class CertificateGenerator:
         qr_x = width - margin - qr_size - 10
         qr_y = sig_y + (sig_height - qr_size) / 2
 
-        qr_data = f"https://verify.securewipe.com/cert/{payload.get('certificate_id', 'unknown')}"
+        qr_data = f"https://verify.securewipe.com/cert/{payload.certificate_id or 'unknown'}"
         qr_img = self.generate_qr_code(qr_data)
-        
+
         qr_buffer = io.BytesIO()
         qr_img.save(qr_buffer, format="PNG")
         qr_buffer.seek(0)
@@ -244,22 +237,23 @@ class CertificateGenerator:
         c.setFillColor(self.label_gray)
         c.drawCentredString(qr_x + qr_size/2, qr_y - 12, "Scan to Verify")
 
-        # Footer
         footer_y = 40
         c.setFont("Helvetica", 8)
         c.setFillColor(self.dark_gray)
-        c.drawCentredString(width/2, footer_y, 
+        c.drawCentredString(width/2, footer_y,
             "This certificate is digitally signed and tamper-proof. Verification can be performed using our SecureWipe Portal.")
-        
+
         c.setFont("Helvetica", 7)
         c.setFillColor(self.label_gray)
         c.drawCentredString(width/2, footer_y - 15,
             "© 2025 SecureWipe. All Rights Reserved.")
 
-        # Decorative border
         c.setStrokeColor(self.primary_blue)
         c.setLineWidth(2)
         c.roundRect(20, 20, width - 40, height - 40, 15, stroke=1, fill=0)
 
         c.showPage()
         c.save()
+
+        buffer.seek(0)
+        return buffer.read()

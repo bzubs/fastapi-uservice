@@ -1,20 +1,23 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, UploadFile, Depends, File
+from fastapi.responses import JSONResponse, StreamingResponse
 import json, uuid
-from pathlib import Path
 from .config import CERT_DIR
 from .wipe import wipe_folder, log_hash
 from .signing import sign_payload, verify_payload
 from .pdfgen import CertificateGenerator
-from .pdfsign import sign_pdf_with_pyhanko, verify_pdf_signed_by_our_key
-from .schemas import WipeRequest, DriveHealthInput
+from .pdfsign import sign_pdf, verify_pdf_signed_by_our_key
+from .schemas import WipeRequest, DriveHealthInput, GenerateRequest
 from .predict import predict_drive_health
 from .code import get_features
+from .security import require_internal_api_key
+import io
+from dotenv import load_dotenv
 
+load_dotenv()
 
 app = FastAPI(title="SecureWipe Service")
 
-certgen = CertificateGenerator('keys/private_key.pem')
+certgen = CertificateGenerator()
 
 
 # PDF directories
@@ -40,8 +43,8 @@ def start_wipe(req: WipeRequest):
             "username": req.username,
             "device": req.device.dict(),
             "wipe": {
-                "method": rec["wipe"]["method"],
-                "policy": "NIST SP 800-88",
+                "method": req.method,
+                "policy": req.policy,
                 "started_at": rec["wipe"]["start_time"],
                 "completed_at": rec["wipe"]["end_time"],
                 "result": rec["final_result"],
@@ -53,33 +56,17 @@ def start_wipe(req: WipeRequest):
         # Sign certificate JSON
         signed = sign_payload(cert_payload)
 
+        signed = GenerateRequest(**signed)
+
         # Save JSON certificate
         cert_file = CERT_DIR / f"{cert_id}.json"
-        cert_file.write_text(json.dumps(signed))
-
-        # Generate unsigned PDF
-        pdf_unsigned_out = PDF_UNSIGNED_DIR / f"{cert_id}.pdf"
-        try:
-            certgen.generate_certificate_pdf(signed, pdf_unsigned_out)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
-
-        # Sign PDF and save in signed PDF directory
-        pdf_signed_out = PDF_SIGNED_DIR / f"{cert_id}_signed.pdf"
-        try:
-            sign_pdf_with_pyhanko(str(pdf_unsigned_out), str(pdf_signed_out))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"PDF signing failed: {e}")
-
-        if not pdf_signed_out.exists():
-            raise HTTPException(status_code=500, detail="Signed PDF not found after signing")
+        cert_file.write_text(signed.model_dump_json(indent=2)) 
 
         # Return paths; GET endpoint for PDF still points to signed PDF
         return {
             "job_id": cert_id,
             "status": "completed",
-            "certificate_json": signed,
-            "certificate_pdf": str(pdf_signed_out),
+            "certificate_json": signed.dict(),
         }
 
     except Exception as e:
@@ -94,7 +81,30 @@ def get_certificate(cert_id: str):
     return JSONResponse(content=json.loads(cert_file.read_text()))
 
 
-@app.get("/api/certificates/{cert_id}/pdf")
+@app.post("/api/genpdf", dependencies=[Depends(require_internal_api_key)])
+def generate_pdf(req: GenerateRequest):
+    try:
+        pdf_bytes = certgen.generate_certificate_pdf(req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+
+        # Sign PDF and save in signed PDF directory
+    pdf_buffer = io.BytesIO(pdf_bytes)
+    try:
+        signed_buffer = sign_pdf(pdf_buffer)
+        signed_buffer.seek(0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF signing failed: {e}")
+    
+    return StreamingResponse(
+        signed_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={req.payload.certificate_id}_signed.pdf"}
+    )
+
+
+#deprecated endpoint, use new /genpdf endpoint
+'''@app.get("/api/certificates/{cert_id}/pdf")
 def get_certificate_pdf(cert_id: str):
     pdf_file = PDF_SIGNED_DIR / f"{cert_id}_signed.pdf"
     if not pdf_file.exists():
@@ -103,9 +113,9 @@ def get_certificate_pdf(cert_id: str):
         str(pdf_file),
         media_type="application/pdf",
         filename=f"{cert_id}_signed.pdf",
-    )
+    )'''
 
-
+#json verification end-point
 @app.post("/api/verify-cert")
 def verify_certificate(cert: dict):
     return {"valid": verify_payload(cert)}
@@ -114,8 +124,7 @@ def verify_certificate(cert: dict):
 @app.post("/api/verify-pdf")
 async def verify_pdf_upload(file: UploadFile = File(...)):
     b = await file.read()
-    signer_cert_pem = "keys/certificate.pem"
-    res = await verify_pdf_signed_by_our_key(b, signer_cert_pem)
+    res = await verify_pdf_signed_by_our_key(b)
     return JSONResponse(content=res)
 
 @app.post("/api/drive/health")

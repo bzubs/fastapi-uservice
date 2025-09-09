@@ -1,10 +1,8 @@
 # pdfsign.py
-
 import io
 import os
+import tempfile
 from pathlib import Path
-
-from .config import KEY_DIR, CERT_DIR  # use your config paths
 
 from pyhanko.sign.signers import SimpleSigner, PdfSignatureMetadata
 from pyhanko.sign import signers
@@ -18,50 +16,88 @@ from cryptography import x509 as crypto_x509
 from cryptography.hazmat.primitives import serialization
 from asn1crypto import x509 as asn1_x509
 
+from dotenv import load_dotenv
 
-# File locations inside your folders
-KEY_PATH = KEY_DIR / "private_key.pem"
-CERT_PATH = CERT_DIR / "certificate.pem"
+load_dotenv()
 
 
-def ensure_cert_files():
+def _write_env_pems_to_tempfiles() -> tuple[str, str, tempfile.TemporaryDirectory]:
     """
-    Ensure PEM key/cert files exist locally.
-    - Uses Railway env vars PRIVATE_KEY_PEM and CERTIFICATE_PEM if provided.
-    - Falls back to files in keys/ and certificates/ if present.
+    Write PRIVATE_KEY_PEM and CERTIFICATE_PEM env vars to files inside a TemporaryDirectory.
+    Returns (priv_path_str, cert_path_str, tmpdir_obj).
+    Caller is responsible for calling tmpdir_obj.cleanup() when done (or using the tmpdir context manager).
     """
     priv_data = os.getenv("PRIVATE_KEY_PEM")
     cert_data = os.getenv("CERTIFICATE_PEM")
 
-    if priv_data and not KEY_PATH.exists():
-        KEY_PATH.write_text(priv_data)
-    if cert_data and not CERT_PATH.exists():
-        CERT_PATH.write_text(cert_data)
+    if not priv_data or not cert_data:
+        raise RuntimeError("Missing PRIVATE_KEY_PEM or CERTIFICATE_PEM environment variables")
 
-    if not KEY_PATH.exists() or not CERT_PATH.exists():
-        raise RuntimeError("Key or cert missing. Provide via env or local files.")
+    tmpdir = tempfile.TemporaryDirectory()
+    tmpdir_path = Path(tmpdir.name)
+    priv_path = tmpdir_path / "private_key.pem"
+    cert_path = tmpdir_path / "certificate.pem"
 
-    return KEY_PATH, CERT_PATH
+    # Write exact PEM bytes (no sanitization)
+    priv_path.write_bytes(priv_data.encode("utf-8"))
+    cert_path.write_bytes(cert_data.encode("utf-8"))
+
+    # Best-effort permission restriction on POSIX
+    try:
+        os.chmod(priv_path, 0o600)
+    except Exception:
+        # ignore on systems that don't support chmod (Windows, etc.)
+        pass
+
+    return str(priv_path), str(cert_path), tmpdir
 
 
-def load_simple_signer():
-    """Load a SimpleSigner using the available key/cert."""
-    key_path, cert_path = ensure_cert_files()
-    return SimpleSigner.load(
-        key_file=key_path,
-        cert_file=cert_path,
-        ca_chain_files=None,
-        key_passphrase=None,
-    )
+def load_simple_signer(remove_temp=True) -> SimpleSigner:
+    """
+    Create a SimpleSigner by writing env PEMs to a temporary directory and calling SimpleSigner.load().
+    remove_temp=True will cleanup the temporary directory after loading the signer.
+    """
+    priv_file, cert_file, tmpdir = _write_env_pems_to_tempfiles()
+
+    try:
+        signer = SimpleSigner.load(
+            key_file=priv_file,
+            cert_file=cert_file,
+            ca_chain_files=None,
+            key_passphrase=None,
+        )
+    except Exception as e:
+        # include file paths in the message for easier debugging (but don't include key contents)
+        # ensure temp directory cleaned up before raising
+        try:
+            tmpdir.cleanup()
+        except Exception:
+            pass
+        raise RuntimeError(f"Failed to load SimpleSigner from files ({priv_file}, {cert_file}): {e}") from e
+
+    # cleanup the tempdir if requested (SimpleSigner.load reads files into memory)
+    if remove_temp:
+        try:
+            tmpdir.cleanup()
+        except Exception:
+            pass
+
+    return signer
 
 
-def sign_pdf_with_pyhanko(input_pdf_path: str, output_pdf_path: str):
-    """Sign a PDF using pyHanko and save to output path."""
-    signer = load_simple_signer()
-    with open(input_pdf_path, "rb") as f:
-        data = f.read()
+def sign_pdf(input_pdf: io.BytesIO) -> io.BytesIO:
+    """
+    Sign a PDF in-memory using pyHanko and the certificate/private key loaded from env.
+    Args:
+        input_pdf: BytesIO object containing the unsigned PDF.
+    Returns:
+        BytesIO object containing the signed PDF.
+    """
+    signer = load_simple_signer(remove_temp=True)
 
-    writer = IncrementalPdfFileWriter(io.BytesIO(data))
+    # ensure buffer position
+    input_pdf.seek(0)
+    writer = IncrementalPdfFileWriter(input_pdf)
 
     # Add a visible signature field
     append_signature_field(
@@ -78,18 +114,20 @@ def sign_pdf_with_pyhanko(input_pdf_path: str, output_pdf_path: str):
 
     out = io.BytesIO()
     pdf_signer.sign_pdf(writer, output=out)
+    out.seek(0)
+    return out
 
-    with open(output_pdf_path, "wb") as f:
-        f.write(out.getvalue())
 
-
-async def verify_pdf_signed_by_our_key(pdf_bytes: bytes, signer_cert_pem_path: str) -> dict:
+async def verify_pdf_signed_by_our_key(pdf_bytes: bytes) -> dict:
     """
-    Verify a PDF's signature against our signer certificate.
-    Returns a dict {valid: bool, coverage: str}.
+    Verify a PDF's signature against our signer certificate (from env).
+    Returns a dict with verification results.
     """
-    with open(signer_cert_pem_path, "rb") as f:
-        pem = f.read()
+    cert_data = os.getenv("CERTIFICATE_PEM")
+    if not cert_data:
+        return {"valid": False, "reason": "Missing CERTIFICATE_PEM env var"}
+
+    pem = cert_data.encode("utf-8")
 
     # Load cert into cryptography + asn1crypto objects
     crypto_cert = crypto_x509.load_pem_x509_certificate(pem)
